@@ -1,4 +1,4 @@
-# Mały świat Izy
+# Miejsce tylko dla Ciebie
 
 Osobista strona w HTML, CSS i JavaScript. Nie wymaga instalacji ani bibliotek.
 
