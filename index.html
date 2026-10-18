@@ -52,6 +52,10 @@
     .bow { color: var(--pink); font-size: 25px; line-height: 1; }
     .brand-name { font-family: var(--serif); font-size: 18px; }
     .header-note { color: var(--muted); font-size: 12px; text-align: right; }
+    .sync-status { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; text-align: right; }
+    .sync-status::before { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: #d2a65a; content: ""; }
+    .sync-status[data-state="connected"]::before { background: var(--mint); }
+    .sync-status[data-state="error"]::before { background: #ec7373; }
 
     .welcome { padding: 44px 0 27px; }
     .eyebrow { margin: 0 0 10px; color: var(--pink); font-size: 11px; text-transform: uppercase; }
@@ -253,7 +257,7 @@
   <div class="page">
     <header class="topbar">
       <div class="brand"><span class="bow" aria-hidden="true">🎀</span><span class="brand-name">Miejsce tylko dla Ciebie</span></div>
-      <span class="header-note">od 24 września · z myślą o Tobie</span>
+      <span class="header-note">od 24 września · z myślą o Tobie<br><span class="sync-status" id="sync-status" data-state="local">Dane tylko na tym urządzeniu</span></span>
     </header>
 
     <section class="welcome" aria-labelledby="headline">
@@ -297,7 +301,7 @@
 
       <section class="panel" id="panel-photos" role="tabpanel" aria-labelledby="tab-photos" tabindex="0" hidden>
         <h2 class="section-heading">Nasze wspólne chwile</h2>
-        <p class="section-copy">Dodaj zdjęcia z tego urządzenia. Zostaną zapisane tylko w tej przeglądarce i nie pojawią się automatycznie na innych urządzeniach.</p>
+        <p class="section-copy" id="gallery-description">Bez połączenia z Supabase zdjęcia zostają zapisane tylko w tej przeglądarce.</p>
         <div class="gallery-tools">
           <label class="upload-button" for="photo-input"><span aria-hidden="true">＋</span><span>Dodaj zdjęcia</span></label>
           <input id="photo-input" type="file" accept="image/*" multiple aria-label="Wybierz wspólne zdjęcia">
@@ -369,6 +373,8 @@
     <footer class="footer"><span>zrobione po cichu, z myślą o Tobie</span><span class="footer-heart">♥</span></footer>
   </div>
 
+  <script src="supabase-config.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script>
     const tabs = [...document.querySelectorAll('[role="tab"]')];
     const panels = [...document.querySelectorAll('[role="tabpanel"]')];
@@ -398,6 +404,186 @@
         activateTab(tabs[nextIndex], true);
       });
     });
+
+    const syncStatus = document.querySelector('#sync-status');
+    const galleryDescription = document.querySelector('#gallery-description');
+    const supabaseConfig = window.SUPABASE_CONFIG || {};
+    const supabaseUrl = typeof supabaseConfig.url === 'string' ? supabaseConfig.url.replace(/\/$/, '') : '';
+    const supabaseKey = typeof supabaseConfig.publishableKey === 'string' ? supabaseConfig.publishableKey.trim() : '';
+    const supabaseClient = supabaseUrl && supabaseKey && window.supabase?.createClient
+      ? window.supabase.createClient(supabaseUrl, supabaseKey)
+      : null;
+    const syncVersionStorageKey = 'iza-shared-state-version-v1';
+    let cloudReady = false;
+    let cloudApplying = false;
+    let cloudSaveTimer = null;
+    let cloudSaveInProgress = false;
+    let cloudSaveQueued = false;
+    let cloudLastUpdatedAt = '';
+
+    function setSyncStatus(message, state = 'local') {
+      syncStatus.textContent = message;
+      syncStatus.dataset.state = state;
+      galleryDescription.textContent = state === 'connected'
+        ? 'Dodaj zdjęcia tutaj, a pojawią się również na drugim urządzeniu.'
+        : 'Bez połączenia z Supabase zdjęcia zostają zapisane tylko w tej przeglądarce.';
+    }
+
+    function readStoredJson(key, fallback) {
+      try { return JSON.parse(localStorage.getItem(key) || JSON.stringify(fallback)); }
+      catch { return fallback; }
+    }
+
+    function readLocalSharedState() {
+      return {
+        checkedTasks: readStoredJson('iza-checklist-v1', []),
+        customTasks: readStoredJson('iza-custom-checklist-v1', []),
+        removedTasks: readStoredJson('iza-removed-checklist-v1', []),
+        quotes: readStoredJson('iza-quotes-v1', []),
+        photos: readStoredJson('iza-gallery-v1', [])
+      };
+    }
+
+    function normalizeSharedState(state = {}) {
+      return {
+        checkedTasks: Array.isArray(state.checkedTasks) ? state.checkedTasks.filter((id) => typeof id === 'string') : [],
+        customTasks: Array.isArray(state.customTasks) ? state.customTasks.filter((task) => task && typeof task.id === 'string' && typeof task.text === 'string') : [],
+        removedTasks: Array.isArray(state.removedTasks) ? state.removedTasks.filter((id) => typeof id === 'string') : [],
+        quotes: Array.isArray(state.quotes) ? state.quotes.filter((quote) => quote && typeof quote.id === 'string' && typeof quote.text === 'string' && typeof quote.explanation === 'string') : [],
+        photos: Array.isArray(state.photos) ? state.photos.filter((photo) => photo && (typeof photo.data === 'string' || typeof photo.url === 'string')) : []
+      };
+    }
+
+    function applySharedState(state, updatedAt) {
+      const normalized = normalizeSharedState(state);
+      localStorage.setItem('iza-checklist-v1', JSON.stringify(normalized.checkedTasks));
+      localStorage.setItem('iza-custom-checklist-v1', JSON.stringify(normalized.customTasks));
+      localStorage.setItem('iza-removed-checklist-v1', JSON.stringify(normalized.removedTasks));
+      localStorage.setItem('iza-quotes-v1', JSON.stringify(normalized.quotes));
+      localStorage.setItem('iza-gallery-v1', JSON.stringify(normalized.photos));
+      localStorage.setItem(syncVersionStorageKey, updatedAt || '');
+    }
+
+    function scheduleCloudSave() {
+      if (!supabaseClient || !cloudReady || cloudApplying) return;
+      clearTimeout(cloudSaveTimer);
+      cloudSaveTimer = setTimeout(saveSharedStateToCloud, 450);
+    }
+
+    async function uploadBlobToCloud(blob, id = '') {
+      const extension = ({ 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' })[blob.type];
+      if (!extension) throw new Error('Zdjęcie musi być w formacie JPG, PNG, WebP lub GIF.');
+      const path = `${crypto.randomUUID()}.${extension}`;
+      const { error } = await supabaseClient.storage.from('shared-photos').upload(path, blob, { contentType: blob.type, upsert: false });
+      if (error) throw error;
+      const { data } = supabaseClient.storage.from('shared-photos').getPublicUrl(path);
+      return { id: id || path, path, url: data.publicUrl };
+    }
+
+    async function uploadPhotoToCloud(photo) {
+      if (photo.path && photo.url) return photo;
+      const blob = await fetch(photo.data).then((response) => response.blob());
+      return uploadBlobToCloud(blob, photo.id);
+    }
+
+    async function readSharedStateFromCloud() {
+      const { data, error } = await supabaseClient.from('shared_site_state').select('payload, updated_at').eq('id', 'main').maybeSingle();
+      if (error) throw error;
+      return data;
+    }
+
+    async function saveSharedStateToCloud() {
+      if (cloudSaveInProgress || !supabaseClient || !cloudReady || cloudApplying) {
+        cloudSaveQueued = true;
+        return;
+      }
+      cloudSaveInProgress = true;
+      cloudSaveQueued = false;
+      setSyncStatus('Zapisywanie zmian…', 'local');
+      try {
+        const localState = readLocalSharedState();
+        const remotePhotos = await Promise.all(localState.photos.map(uploadPhotoToCloud));
+        const payload = { ...localState, photos: remotePhotos };
+        const previous = await readSharedStateFromCloud();
+        const { data, error } = await supabaseClient.from('shared_site_state')
+          .upsert({ id: 'main', payload }, { onConflict: 'id' })
+          .select('updated_at')
+          .single();
+        if (error) throw error;
+        const currentPhotoPaths = new Set(remotePhotos.map((photo) => photo.path).filter(Boolean));
+        const removedPaths = normalizeSharedState(previous?.payload).photos.map((photo) => photo.path).filter((path) => path && !currentPhotoPaths.has(path));
+        if (removedPaths.length) {
+          const { error: removeError } = await supabaseClient.storage.from('shared-photos').remove(removedPaths);
+          if (removeError) throw removeError;
+        }
+        localStorage.setItem('iza-gallery-v1', JSON.stringify(remotePhotos));
+        cloudLastUpdatedAt = data.updated_at;
+        localStorage.setItem(syncVersionStorageKey, cloudLastUpdatedAt);
+        setSyncStatus('Zmiany synchronizują się z innymi urządzeniami', 'connected');
+      } catch (error) {
+        console.error('Supabase sync failed:', error);
+        setSyncStatus('Błąd synchronizacji — sprawdź konfigurację Supabase', 'error');
+      } finally {
+        cloudSaveInProgress = false;
+        if (cloudSaveQueued) scheduleCloudSave();
+      }
+    }
+
+    function reloadWithSharedState(state, updatedAt) {
+      cloudApplying = true;
+      applySharedState(state, updatedAt);
+      const activeTab = document.querySelector('[role="tab"][aria-selected="true"]')?.id;
+      if (activeTab) sessionStorage.setItem('iza-active-tab-v1', activeTab);
+      window.location.reload();
+    }
+
+    async function checkForSharedChanges() {
+      if (!cloudReady || cloudApplying || cloudSaveInProgress || cloudSaveTimer) return;
+      try {
+        const remote = await readSharedStateFromCloud();
+        if (!remote || remote.updated_at === cloudLastUpdatedAt) return;
+        reloadWithSharedState(remote.payload, remote.updated_at);
+      } catch (error) {
+        console.error('Supabase refresh failed:', error);
+        setSyncStatus('Nie udało się pobrać wspólnych zmian', 'error');
+      }
+    }
+
+    async function startSharedSync() {
+      if (!supabaseClient) {
+        setSyncStatus('Dodaj dane Supabase, aby włączyć synchronizację', 'local');
+        return;
+      }
+      setSyncStatus('Łączenie z Supabase…', 'local');
+      try {
+        const remote = await readSharedStateFromCloud();
+        if (!remote) {
+          cloudReady = true;
+          await saveSharedStateToCloud();
+        } else {
+          const localVersion = localStorage.getItem(syncVersionStorageKey) || '';
+          const remoteState = normalizeSharedState(remote.payload);
+          const localState = normalizeSharedState(readLocalSharedState());
+          cloudLastUpdatedAt = remote.updated_at;
+          if (JSON.stringify(localState) !== JSON.stringify(remoteState) || localVersion !== remote.updated_at) {
+            reloadWithSharedState(remoteState, remote.updated_at);
+            return;
+          }
+          cloudReady = true;
+          setSyncStatus('Dane wspólne są aktualne', 'connected');
+        }
+        window.setInterval(checkForSharedChanges, 5000);
+      } catch (error) {
+        console.error('Supabase connection failed:', error);
+        setSyncStatus('Brak połączenia z Supabase — dane lokalne', 'error');
+      }
+    }
+
+    const rememberedTab = sessionStorage.getItem('iza-active-tab-v1');
+    if (rememberedTab && document.getElementById(rememberedTab)) {
+      activateTab(document.getElementById(rememberedTab));
+      sessionStorage.removeItem('iza-active-tab-v1');
+    }
 
     const checklist = document.querySelector('#checklist');
     const checklistStorageKey = 'iza-checklist-v1';
@@ -483,6 +669,7 @@
       try {
         localStorage.setItem(checklistStorageKey, JSON.stringify(checklistInputs.filter((input) => input.checked).map((input) => input.dataset.task)));
       } catch {}
+      scheduleCloudSave();
     }
 
     try {
@@ -551,6 +738,7 @@
         removeButton.addEventListener('click', () => {
           const updatedQuotes = loadQuotes().filter((savedQuote) => savedQuote.id !== quote.id);
           localStorage.setItem(quoteStorageKey, JSON.stringify(updatedQuotes));
+          scheduleCloudSave();
           renderQuotes();
         });
         card.append(quoteText, explanation, removeButton);
@@ -567,6 +755,7 @@
       quotes.push({ id: `quote-${Date.now()}-${Math.random().toString(36).slice(2)}`, text, explanation });
       try {
         localStorage.setItem(quoteStorageKey, JSON.stringify(quotes));
+        scheduleCloudSave();
         quoteForm.reset();
         quoteStatus.textContent = 'Cytat zapisany.';
         renderQuotes();
@@ -598,7 +787,7 @@
         const figure = document.createElement('figure');
         figure.className = 'photo-card';
         const image = document.createElement('img');
-        image.src = photo.data;
+        image.src = photo.url || photo.data;
         image.alt = `Wspólne zdjęcie ${index + 1}`;
         image.loading = 'lazy';
         const caption = document.createElement('figcaption');
@@ -613,12 +802,13 @@
           updatedPhotos.splice(index, 1);
           localStorage.setItem(photosStorageKey, JSON.stringify(updatedPhotos));
           renderPhotos(updatedPhotos);
+          scheduleCloudSave();
         });
         figure.append(image, caption, removeButton);
         gallery.append(figure);
       });
       clearPhotosButton.hidden = false;
-      galleryNote.textContent = `${photos.length} ${photos.length === 1 ? 'zdjęcie' : 'zdjęć'} zapisanych na tym urządzeniu`;
+      galleryNote.textContent = `${photos.length} ${photos.length === 1 ? 'zdjęcie' : 'zdjęć'} w galerii`;
     }
 
     function loadPhotos() {
@@ -628,10 +818,24 @@
 
     renderPhotos(loadPhotos());
 
-    photoInput.addEventListener('change', () => {
+    photoInput.addEventListener('change', async () => {
       const selected = [...photoInput.files];
       if (!selected.length) return;
       const current = loadPhotos();
+      if (supabaseClient && cloudReady) {
+        try {
+          const uploaded = await Promise.all(selected.map((file) => uploadBlobToCloud(file)));
+          const combined = [...current, ...uploaded];
+          localStorage.setItem(photosStorageKey, JSON.stringify(combined));
+          renderPhotos(combined);
+          scheduleCloudSave();
+        } catch (error) {
+          console.error('Photo upload failed:', error);
+          galleryNote.textContent = error.message || 'Nie udało się przesłać zdjęcia.';
+        }
+        photoInput.value = '';
+        return;
+      }
       const readers = selected.map((file) => new Promise((resolve) => {
         const reader = new FileReader();
         reader.onload = () => resolve({ data: reader.result });
@@ -643,6 +847,7 @@
         try {
           localStorage.setItem(photosStorageKey, JSON.stringify(combined));
           renderPhotos(combined);
+          scheduleCloudSave();
         } catch {
           galleryNote.textContent = 'Brak miejsca na zapis. Wybierz mniej lub mniejsze zdjęcia.';
         }
@@ -653,7 +858,10 @@
     clearPhotosButton.addEventListener('click', () => {
       localStorage.removeItem(photosStorageKey);
       renderPhotos([]);
+      scheduleCloudSave();
     });
+
+    startSharedSync();
 
     const reasons = [
       'Za to, że potrafisz wesprzeć mnie wtedy, kiedy tego potrzebuję.',
